@@ -1,21 +1,31 @@
 const http = require('http');
 const url = require('url');
 const os = require('os');
+const { exec } = require('child_process');
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
-const GRAVITY = 9.81;
+const GRAVITY = 9.81; // Tiažové zrýchlenie g = 9.81 m/s^2
 
 /**
- * Calculates projectile trajectory points
- * @param {number} velocity Initial velocity in m/s
- * @param {number} angleDegrees Launch angle in degrees
- * @returns {Array<{time: number, x: number, y: number}>}
+ * Fyzikálny výpočet trajektórie šikmého vrhu bez odporu vzduchu.
+ *
+ * Pohybové rovnice:
+ *   - Horizontálna poloha (rovnomerný priamočiary pohyb):
+ *       x(t) = v0 * cos(alpha) * t
+ *   - Vertikálna poloha (rovnomerne spomalený/zrýchlený pohyb v gravitačnom poli):
+ *       y(t) = v0 * sin(alpha) * t - 0.5 * g * t^2
+ *   - Celkový čas letu (keď y = 0 pri dopade):
+ *       T_dopadu = (2 * v0 * sin(alpha)) / g
+ *
+ * @param {number} velocity Počiatočná rýchlosť v0 [m/s]
+ * @param {number} angleDegrees Elevačný uhol v stupňoch
+ * @returns {Array<{time: number, x: number, y: number}>} Pole bodov trajektórie
  */
 function calculateTrajectory(velocity, angleDegrees) {
     const angleRadians = (angleDegrees * Math.PI) / 180.0;
     const timeOfFlight = (2 * velocity * Math.sin(angleRadians)) / GRAVITY;
-    const timeStep = 0.05;
+    const timeStep = 0.05; // Časový krok delta_t = 0.05 s
     const points = [];
 
     let currentTime = 0.0;
@@ -33,6 +43,7 @@ function calculateTrajectory(velocity, angleDegrees) {
         currentTime += timeStep;
     }
 
+    // Dopadový koncový bod na zemi (y = 0)
     if (timeOfFlight > 0) {
         const finalX = velocity * Math.cos(angleRadians) * timeOfFlight;
         const lastPoint = points[points.length - 1];
@@ -48,6 +59,9 @@ function calculateTrajectory(velocity, angleDegrees) {
     return points;
 }
 
+/**
+ * Získa lokálne IP adresy počítača (pre Wi-Fi / LAN pripojenie)
+ */
 function getLocalIpAddresses() {
     const interfaces = os.networkInterfaces();
     const addresses = [];
@@ -61,8 +75,21 @@ function getLocalIpAddresses() {
     return addresses;
 }
 
+/**
+ * Automaticky prepojí port servera s pripojeným Android emulátorom cez ADB
+ */
+function setupAdbReverse(port) {
+    const adbCmd = `adb reverse tcp:${port} tcp:${port} 2>/dev/null || "${process.env.HOME}/Library/Android/sdk/platform-tools/adb" reverse tcp:${port} tcp:${port} 2>/dev/null`;
+    exec(adbCmd, (err, stdout) => {
+        if (!err && stdout) {
+            console.log(`[SERVER] [ADB] Úspešne prepojené s Android emulátorom (adb reverse tcp:${port})`);
+        }
+    });
+}
+
+// Vytvorenie HTTP servera
 const server = http.createServer((req, res) => {
-    // Enable CORS
+    // Povolenie CORS hlavičiek
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -75,6 +102,7 @@ const server = http.createServer((req, res) => {
 
     const parsedUrl = url.parse(req.url, true);
 
+    // Endpoint pre výpočet trajektórie: POST /trajectory alebo GET /trajectory
     if (parsedUrl.pathname === '/trajectory' || parsedUrl.pathname === '/') {
         const handleTrajectoryRequest = (velocityVal, angleVal) => {
             const velocity = parseFloat(velocityVal);
@@ -82,10 +110,11 @@ const server = http.createServer((req, res) => {
 
             console.log('\n==================================================');
             console.log(`[SERVER] ${new Date().toLocaleTimeString()} - Prijatá požiadavka od klienta`);
-            console.log(`[SERVER] >>> Prijaté parametre:`);
+            console.log(`[SERVER] >>> Prijaté parametre od klienta:`);
             console.log(`         - Počiatočná rýchlosť (velocity): ${velocityVal} m/s`);
-            console.log(`         - Uhol (angle):                   ${angleVal}°`);
+            console.log(`         - Elevačný uhol (angle):          ${angleVal}°`);
 
+            // Validácia prijatých parametrov
             if (isNaN(velocity) || isNaN(angle) || velocity <= 0 || angle <= 0 || angle >= 90) {
                 console.log(`[SERVER] [CHYBA] Neplatné parametre: velocity=${velocityVal}, angle=${angleVal}`);
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -93,19 +122,21 @@ const server = http.createServer((req, res) => {
                 return;
             }
 
+            // Fyzikálny výpočet
             const points = calculateTrajectory(velocity, angle);
             const maxDistance = points.length > 0 ? points[points.length - 1].x : 0;
             const maxHeight = Math.max(...points.map(p => p.y));
             const flightTime = points.length > 0 ? points[points.length - 1].time : 0;
 
-            console.log(`[SERVER] Výpočet dokončený:`);
+            console.log(`[SERVER] Výpočet trajektórie dokončený:`);
             console.log(`         - Celkový čas letu:  ${flightTime.toFixed(2)} s`);
             console.log(`         - Maximálna výška:   ${maxHeight.toFixed(2)} m`);
-            console.log(`         - Dolet:             ${maxDistance.toFixed(2)} m`);
+            console.log(`         - Celkový dolet:     ${maxDistance.toFixed(2)} m`);
             console.log(`         - Počet bodov:       ${points.length}`);
             console.log(`[SERVER] Odosielam ${points.length} bodov späť klientovi...`);
             console.log('==================================================');
 
+            // Odoslanie JSON odpovede klientovi
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(points));
         };
@@ -136,16 +167,16 @@ const server = http.createServer((req, res) => {
     }
 });
 
+// Spustenie počúvania servera
 server.listen(PORT, HOST, () => {
+    setupAdbReverse(PORT);
     const localIps = getLocalIpAddresses();
     console.log(`==================================================`);
     console.log(`[SERVER] Node.js server beží na porte ${PORT}`);
-    console.log(`[SERVER] Dostupné adresy URL pre aplikáciu:`);
-    console.log(`  -> Pre Android Emulator:  http://10.0.2.2:${PORT}`);
-    console.log(`  -> Pre Desktop / Local:   http://127.0.0.1:${PORT}`);
+    console.log(`[SERVER] V aplikácii použite: http://127.0.0.1:${PORT}`);
     if (localIps.length > 0) {
         localIps.forEach(ip => {
-            console.log(`  -> Pre Fyzický telefón (Wi-Fi): http://${ip}:${PORT}`);
+            console.log(`  -> Alternatíva (Wi-Fi): http://${ip}:${PORT}`);
         });
     }
     console.log(`[SERVER] Čakám na požiadavky od klienta...`);

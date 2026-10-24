@@ -16,8 +16,18 @@ import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
+/**
+ * Hlavná aktivita (Klient):
+ * - Získava od používateľa počiatočnú rýchlosť (v0) a elevačný uhol (alpha).
+ * - Odosiela tieto parametre na Node.js server cez HTTP POST v JSON formáte.
+ * - Prijíma vypočítané body trajektórie zo servera a odovzdáva ich aktivitám pre zoznam, graf a animáciu.
+ */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var editTextServerUrl: EditText
@@ -29,6 +39,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var buttonGraph: Button
     private lateinit var buttonAnimation: Button
 
+    // Zoznam prijatých bodov
     private val trajectoryPoints = mutableListOf<TrajectoryPoint>()
     private val trajectoryPointsParcel = ArrayList<TrajectoryPointParcel>()
 
@@ -42,6 +53,7 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
+        // Inicializácia UI prvkov
         editTextServerUrl = findViewById(R.id.editTextServerUrl)
         editTextInitialVelocity = findViewById(R.id.editTextInitialVelocity)
         editTextAngle = findViewById(R.id.editTextAngle)
@@ -51,56 +63,65 @@ class MainActivity : AppCompatActivity() {
         buttonGraph = findViewById(R.id.buttonGraph)
         buttonAnimation = findViewById(R.id.buttonAnimation)
 
+        // Odoslanie požiadavky na server
         buttonCalculate.setOnClickListener {
             fetchTrajectoryFromServer()
         }
 
+        // Zobrazenie tabuľkového zoznamu bodov
         buttonList.setOnClickListener {
             if (trajectoryPointsParcel.isNotEmpty()) {
                 val intent = Intent(this, TrajectoryListActivity::class.java)
                 intent.putParcelableArrayListExtra("trajectory_data", trajectoryPointsParcel)
                 startActivity(intent)
             } else {
-                Toast.makeText(this, "Calculate trajectory first to see the list.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Najprv vypočítajte trajektóriu cez server.", Toast.LENGTH_SHORT).show()
             }
         }
 
+        // Zobrazenie 2D grafu trajektórie
         buttonGraph.setOnClickListener {
             if (trajectoryPointsParcel.isNotEmpty()) {
                 val intent = Intent(this, GraphActivity::class.java)
                 intent.putParcelableArrayListExtra("trajectory_data", trajectoryPointsParcel)
                 startActivity(intent)
             } else {
-                Toast.makeText(this, "Calculate trajectory first to see the graph.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Najprv vypočítajte trajektóriu cez server.", Toast.LENGTH_SHORT).show()
             }
         }
 
+        // Zobrazenie fyzikálnej animácie letu
         buttonAnimation.setOnClickListener {
             if (trajectoryPointsParcel.isNotEmpty()) {
                 val intent = Intent(this, TrajectoryAnimationActivity::class.java)
                 intent.putParcelableArrayListExtra("trajectory_data", trajectoryPointsParcel)
                 startActivity(intent)
             } else {
-                Toast.makeText(this, "Calculate trajectory first to see the animation.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Najprv vypočítajte trajektóriu cez server.", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
+    /**
+     * Zabezpečuje sieťovú komunikáciu so serverom na pozadí (v samostatnom vlákne).
+     * Využíva paralelný Smart-Connect pre okamžité nájdenie spojenia bez zamŕzania.
+     */
     private fun fetchTrajectoryFromServer() {
         var serverUrlStr = editTextServerUrl.text.toString().trim()
         val initialVelocityStr = editTextInitialVelocity.text.toString().trim()
         val angleStr = editTextAngle.text.toString().trim()
 
         if (serverUrlStr.isEmpty()) {
-            serverUrlStr = "http://10.0.2.2:3000"
+            serverUrlStr = "http://127.0.0.1:3000"
             editTextServerUrl.setText(serverUrlStr)
         } else if (!serverUrlStr.startsWith("http://") && !serverUrlStr.startsWith("https://")) {
             serverUrlStr = "http://$serverUrlStr"
             editTextServerUrl.setText(serverUrlStr)
         }
 
+        // Validácia vstupov
         if (initialVelocityStr.isEmpty() || angleStr.isEmpty()) {
-            Toast.makeText(this, "Please enter both velocity and angle", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Zadajte počiatočnú rýchlosť aj uhol.", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -108,11 +129,11 @@ class MainActivity : AppCompatActivity() {
         val angleDegrees = angleStr.toDoubleOrNull()
 
         if (initialVelocity == null || angleDegrees == null || initialVelocity <= 0 || angleDegrees <= 0 || angleDegrees >= 90) {
-            Toast.makeText(this, "Invalid input. Velocity and angle must be positive, and angle < 90", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Neplatný vstup: Rýchlosť a uhol musia byť kladné, uhol < 90°.", Toast.LENGTH_LONG).show()
             return
         }
 
-        textViewStatus.text = "Sending request to server..."
+        textViewStatus.text = "Pripájam sa k serveru..."
         buttonCalculate.isEnabled = false
 
         val primaryEndpoint = if (serverUrlStr.endsWith("/trajectory")) {
@@ -121,52 +142,71 @@ class MainActivity : AppCompatActivity() {
             "${serverUrlStr.removeSuffix("/")}/trajectory"
         }
 
-        // Build list of candidate endpoints to auto-try if local connection times out
-        val candidateEndpoints = mutableListOf(primaryEndpoint)
-        if (primaryEndpoint.contains("10.0.2.2")) {
-            candidateEndpoints.add(primaryEndpoint.replace("10.0.2.2", "127.0.0.1"))
-            candidateEndpoints.add(primaryEndpoint.replace("10.0.2.2", "147.175.109.192"))
-        } else if (primaryEndpoint.contains("127.0.0.1")) {
-            candidateEndpoints.add(primaryEndpoint.replace("127.0.0.1", "10.0.2.2"))
-            candidateEndpoints.add(primaryEndpoint.replace("127.0.0.1", "147.175.109.192"))
-        }
+        // Zoznam potenciálnych lokálnych adries na otestovanie (Smart-Fallback)
+        val candidateEndpoints = linkedSetOf<String>()
+        candidateEndpoints.add(primaryEndpoint)
+        candidateEndpoints.add("http://127.0.0.1:3000/trajectory")
+        candidateEndpoints.add("http://10.0.2.2:3000/trajectory")
+        candidateEndpoints.add("http://147.175.109.192:3000/trajectory")
 
+        // Sieťová operácia musí bežať na pozadí mimo hlavného UI vlákna
         thread {
-            var lastException: Exception? = null
-            var fetchedPoints: List<TrajectoryPoint>? = null
-            var successfulEndpoint: String? = null
+            val hasCompleted = AtomicBoolean(false)
+            val latch = CountDownLatch(1)
+            var winningPoints: List<TrajectoryPoint>? = null
+            var winningEndpoint: String? = null
+            var lastErrorMessage = "Nepodarilo sa pripojiť k serveru"
 
-            for (endpoint in candidateEndpoints.distinct()) {
-                try {
-                    Log.d("TrajectoryClient", "Attempting connection to: $endpoint")
-                    fetchedPoints = executeHttpTrajectoryRequest(endpoint, initialVelocity, angleDegrees)
-                    successfulEndpoint = endpoint
-                    break
-                } catch (e: Exception) {
-                    Log.w("TrajectoryClient", "Connection to $endpoint failed: ${e.message}")
-                    lastException = e
+            val executor = Executors.newFixedThreadPool(candidateEndpoints.size)
+
+            // Paralelný test všetkých adries súčasne
+            for (endpoint in candidateEndpoints) {
+                executor.submit {
+                    try {
+                        val result = executeHttpTrajectoryRequest(endpoint, initialVelocity, angleDegrees)
+                        if (hasCompleted.compareAndSet(false, true)) {
+                            winningPoints = result
+                            winningEndpoint = endpoint
+                            latch.countDown()
+                        }
+                    } catch (e: Exception) {
+                        Log.w("TrajectoryClient", "Candidate $endpoint zlyhal: ${e.message}")
+                        lastErrorMessage = e.message ?: "Chyba spojenia"
+                    }
                 }
             }
 
+            // Počkáme max 2.5s na prvú úspešnú odpoveď
+            latch.await(2500, TimeUnit.MILLISECONDS)
+            executor.shutdownNow()
+
+            val points = winningPoints
+            val endpoint = winningEndpoint
+
+            // Návrat na UI vlákno pre aktualizáciu rozhrania
             runOnUiThread {
                 buttonCalculate.isEnabled = true
-                if (fetchedPoints != null && successfulEndpoint != null) {
+                if (points != null && endpoint != null) {
                     trajectoryPoints.clear()
-                    trajectoryPoints.addAll(fetchedPoints)
+                    trajectoryPoints.addAll(points)
                     trajectoryPointsParcel.clear()
-                    trajectoryPointsParcel.addAll(fetchedPoints.map { TrajectoryPointParcel(it.time, it.x, it.y) })
+                    trajectoryPointsParcel.addAll(points.map { TrajectoryPointParcel(it.time, it.x, it.y) })
 
-                    textViewStatus.text = "Received ${fetchedPoints.size} points from $successfulEndpoint"
-                    Toast.makeText(this@MainActivity, "Received ${fetchedPoints.size} points from server!", Toast.LENGTH_LONG).show()
+                    editTextServerUrl.setText(endpoint.removeSuffix("/trajectory"))
+                    textViewStatus.text = "Úspech: Prijatých ${points.size} bodov zo servera ($endpoint)"
+                    Toast.makeText(this@MainActivity, "Prijatých ${points.size} bodov zo servera!", Toast.LENGTH_LONG).show()
                 } else {
-                    val errMsg = lastException?.message ?: "Unknown error"
-                    textViewStatus.text = "Connection failed: $errMsg"
-                    Toast.makeText(this@MainActivity, "Cannot connect to server. Is 'node server.js' running?", Toast.LENGTH_LONG).show()
+                    textViewStatus.text = "Chyba pripojenia: $lastErrorMessage"
+                    Toast.makeText(this@MainActivity, "Nedá sa pripojiť k serveru. Beží 'node server.js'?", Toast.LENGTH_LONG).show()
                 }
             }
         }
     }
 
+    /**
+     * Vykoná HTTP POST požiadavku s JSON telom: { "velocity": ..., "angle": ... }
+     * a vráti naparsovaný zoznam bodov [TrajectoryPoint].
+     */
     private fun executeHttpTrajectoryRequest(endpoint: String, velocity: Double, angle: Double): List<TrajectoryPoint> {
         val url = URL(endpoint)
         val conn = url.openConnection() as HttpURLConnection
@@ -174,25 +214,29 @@ class MainActivity : AppCompatActivity() {
         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
         conn.setRequestProperty("Accept", "application/json")
         conn.doOutput = true
-        conn.connectTimeout = 3000
-        conn.readTimeout = 3000
+        conn.connectTimeout = 1800
+        conn.readTimeout = 1800
 
+        // Vytvorenie JSON požiadavky
         val payload = JSONObject().apply {
             put("velocity", velocity)
             put("angle", angle)
         }
 
+        // Odoslanie dát serveru
         OutputStreamWriter(conn.outputStream, "UTF-8").use { writer ->
             writer.write(payload.toString())
             writer.flush()
         }
 
+        // Spracovanie odpovede
         val responseCode = conn.responseCode
         if (responseCode == HttpURLConnection.HTTP_OK) {
             val responseText = conn.inputStream.bufferedReader().use { it.readText() }
             val jsonArray = JSONArray(responseText)
             val points = mutableListOf<TrajectoryPoint>()
 
+            // Parsovanie prijatého poľa JSON objektov: [{ time, x, y }, ...]
             for (i in 0 until jsonArray.length()) {
                 val obj = jsonArray.getJSONObject(i)
                 val time = obj.getDouble("time")
@@ -201,7 +245,7 @@ class MainActivity : AppCompatActivity() {
                 points.add(TrajectoryPoint(time, x, y))
             }
 
-            Log.d("TrajectoryClient", "Successfully fetched ${points.size} points from $endpoint")
+            Log.d("TrajectoryClient", "Úspešne prijatých ${points.size} bodov z $endpoint")
             return points
         } else {
             val errorText = try {
@@ -209,7 +253,7 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {
                 "HTTP $responseCode"
             }
-            throw RuntimeException("Server error ($responseCode): $errorText")
+            throw RuntimeException("Chyba servera ($responseCode): $errorText")
         }
     }
 }
